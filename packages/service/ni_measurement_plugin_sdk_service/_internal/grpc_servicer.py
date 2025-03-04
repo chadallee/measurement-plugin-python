@@ -127,15 +127,30 @@ measurement_service_context: ContextVar[MeasurementServiceContext] = ContextVar(
 )
 
 
-def _get_mapping_by_parameter_name(
-    mapping_by_id: Dict[int, Any], measure_function: Callable[[], None]
-) -> Dict[str, Any]:
-    """Transform a mapping by id into a mapping by parameter name (i.e. kwargs)."""
+_UNSET_MAPPING = object()
+def _split_parameters(
+    mapping_by_variable_name: Dict[str, Any], measure_function: Callable[[], None]
+) -> (Tuple, Dict[str, Any]):
+    """Split a mapping by variable name into two groups: positional-only arguments and keyword arguments"""
     signature = inspect.signature(measure_function)
-    mapping_by_variable_name = {}
-    for i, parameter in enumerate(signature.parameters.values(), start=1):
-        mapping_by_variable_name[parameter.name] = mapping_by_id[i]
-    return mapping_by_variable_name
+    positional_args = []
+    keyword_args = {}
+    for parameter in signature.parameters.values():
+        parameter_value = mapping_by_variable_name.get(parameter.name, _UNSET_MAPPING)
+        if parameter.kind == parameter.POSITIONAL_ONLY:
+            if parameter_value is not _UNSET_MAPPING:
+                positional_args.append(parameter_value)
+            elif parameter.default is not inspect._empty:
+                positional_args.append(parameter.default)
+            else:
+                raise TypeError(
+                    f"Measurement function: required positional-only parameter not provided: {parameter.name}"
+                )
+        else:
+            if parameter_value is not _UNSET_MAPPING:
+                keyword_args[parameter.name] = parameter_value
+    positional_args = tuple(positional_args)
+    return (positional_args, keyword_args)
 
 
 def _serialize_outputs(
@@ -242,20 +257,20 @@ class MeasurementServiceServicerV1(v1_measurement_service_pb2_grpc.MeasurementSe
     ) -> v1_measurement_service_pb2.MeasureResponse:
         """RPC API that executes the registered measurement method."""
         self._validate_parameters(request)
-        mapping_by_id = decoder.deserialize_parameters(
+        mapping_by_variable_name = decoder.deserialize_parameters(
             self._configuration_metadata,
             request.configuration_parameters.value,
             self._configuration_parameters_message_type,
         )
-        mapping_by_variable_name = _get_mapping_by_parameter_name(
-            mapping_by_id, self._measure_function
+        (positional_args, keyword_args) = _split_parameters(
+            mapping_by_variable_name, self._measure_function
         )
         pin_map_context = PinMapContext._from_grpc(request.pin_map_context)
         token = measurement_service_context.set(
             MeasurementServiceContext(context, pin_map_context, self._owner)
         )
         try:
-            return_value = self._measure_function(**mapping_by_variable_name)
+            return_value = self._measure_function(*positional_args, **keyword_args)
             if isinstance(return_value, collections.abc.Generator):
                 with contextlib.closing(return_value) as output_iter:
                     outputs = None
@@ -371,20 +386,20 @@ class MeasurementServiceServicerV2(v2_measurement_service_pb2_grpc.MeasurementSe
     ) -> Generator[v2_measurement_service_pb2.MeasureResponse, None, None]:
         """RPC API that executes the registered measurement method."""
         self._validate_parameters(request)
-        mapping_by_id = decoder.deserialize_parameters(
+        mapping_by_variable_name = decoder.deserialize_parameters(
             self._configuration_metadata,
             request.configuration_parameters.value,
             self._configuration_parameters_message_type,
         )
-        mapping_by_variable_name = _get_mapping_by_parameter_name(
-            mapping_by_id, self._measure_function
+        (positional_args, keyword_args) = _split_parameters(
+            mapping_by_variable_name, self._measure_function
         )
         pin_map_context = PinMapContext._from_grpc(request.pin_map_context)
         token = measurement_service_context.set(
             MeasurementServiceContext(context, pin_map_context, self._owner)
         )
         try:
-            return_value = self._measure_function(**mapping_by_variable_name)
+            return_value = self._measure_function(*positional_args, **keyword_args)
             if isinstance(return_value, collections.abc.Generator):
                 with contextlib.closing(return_value) as output_iter:
                     try:
